@@ -1,0 +1,120 @@
+name: "🛡️ Snow Cell RDP watchdog"
+
+# OPTIONAL safety net for the auto-restart chain.
+#
+# The main workflow (setup.yml) normally queues its own successor in its last job. That job cannot
+# run when GitHub kills the whole run (runner lost, outage) or when a job output is unavailable
+# after a timeout. This watchdog wakes up every 30 minutes and, ONLY IF no session is queued or
+# running, starts the next one - but never:
+#   * the very first session (nothing has run yet),
+#   * after a person cancelled a run (a cancel well before the job timeout),
+#   * after a run that failed within SNOWCELL_MIN_RESTART_MINUTES (restart-loop guard),
+#   * while the repository variable SNOWCELL_AUTORESTART (or SNOWCELL_WATCHDOG) is "false".
+#
+# Delete this file (or disable the workflow in the Actions tab) if you do not want it.
+# Scheduled workflows only run from the default branch, can be delayed by GitHub, and are
+# disabled by GitHub after 60 days without repository activity (public repositories).
+
+on:
+  schedule:
+    - cron: "7,37 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: snowcell-rdp-watchdog
+  cancel-in-progress: false
+
+jobs:
+  watchdog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: write # needed to start a workflow_dispatch run with the built-in token
+      contents: read
+
+    steps:
+      - name: "🛡️ Restart the RDP session chain if it stopped"
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.SNOWCELL_DISPATCH_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+          WORKFLOW_FILE: ${{ vars.SNOWCELL_WORKFLOW_FILE || 'setup.yml' }}
+          AUTORESTART: ${{ vars.SNOWCELL_AUTORESTART }}
+          WATCHDOG: ${{ vars.SNOWCELL_WATCHDOG }}
+          SESSION_MINUTES: ${{ vars.SNOWCELL_SESSION_MINUTES || '355' }}
+          MIN_RUN_MINUTES: ${{ vars.SNOWCELL_MIN_RESTART_MINUTES || '30' }}
+          GRACE_MINUTES: ${{ vars.SNOWCELL_WATCHDOG_GRACE_MINUTES || '10' }}
+          JOB_TIMEOUT_MINUTES: "359" # same number as timeout-minutes in setup.yml
+        run: |
+          set -euo pipefail
+
+          if [ "${AUTORESTART}" = "false" ] || [ "${WATCHDOG}" = "false" ]; then
+            echo "::notice::Auto-restart is switched off (SNOWCELL_AUTORESTART / SNOWCELL_WATCHDOG = false)."
+            exit 0
+          fi
+
+          runs_json="$(gh api "repos/${GH_REPO}/actions/workflows/${WORKFLOW_FILE}/runs?per_page=20")"
+
+          active="$(jq '[.workflow_runs[] | select(.status != "completed")] | length' <<<"${runs_json}")"
+          if [ "${active}" -gt 0 ]; then
+            echo "A session is queued or running (${active} active run(s)); nothing to do."
+            exit 0
+          fi
+
+          latest="$(jq -c '.workflow_runs[0] // empty' <<<"${runs_json}")"
+          if [ -z "${latest}" ]; then
+            echo "::notice::${WORKFLOW_FILE} has never run. The watchdog never starts the first session; start it manually once."
+            exit 0
+          fi
+
+          conclusion="$(jq -r '.conclusion // ""' <<<"${latest}")"
+          run_number="$(jq -r '.run_number' <<<"${latest}")"
+          started_s="$(date -u -d "$(jq -r '.run_started_at' <<<"${latest}")" +%s)"
+          finished_s="$(date -u -d "$(jq -r '.updated_at' <<<"${latest}")" +%s)"
+          now_s="$(date -u +%s)"
+          duration_min=$(( (finished_s - started_s) / 60 ))
+          idle_min=$(( (now_s - finished_s) / 60 ))
+          echo "Latest run: #${run_number}, conclusion '${conclusion}', lasted ${duration_min} min, finished ${idle_min} min ago."
+
+          if [ "${idle_min}" -lt "${GRACE_MINUTES}" ]; then
+            echo "The latest run finished only ${idle_min} min ago; waiting ${GRACE_MINUTES} min before stepping in."
+            exit 0
+          fi
+
+          restart="no"
+          case "${conclusion}" in
+            success|timed_out)
+              restart="yes" ;;
+            cancelled)
+              # A job that hits its timeout can be reported as cancelled; a person cancelling
+              # (usually long before the timeout) must stop the chain.
+              if [ "${duration_min}" -ge $(( JOB_TIMEOUT_MINUTES - 9 )) ]; then
+                restart="yes"
+              else
+                echo "::notice::Run #${run_number} was cancelled after ${duration_min} min (before the job timeout): treated as a deliberate stop; not restarting."
+              fi ;;
+            failure)
+              if [ "${duration_min}" -ge "${MIN_RUN_MINUTES}" ]; then
+                restart="yes"
+              else
+                echo "::warning::Run #${run_number} failed after only ${duration_min} min; not restarting automatically (restart-loop guard). Fix the cause and start the workflow manually."
+              fi ;;
+            *)
+              echo "::notice::Latest conclusion '${conclusion}' does not trigger an automatic restart." ;;
+          esac
+
+          if [ "${restart}" != "yes" ]; then
+            exit 0
+          fi
+
+          gh workflow run "${WORKFLOW_FILE}" --ref "${REF_NAME}" -f "session_minutes=${SESSION_MINUTES}"
+          echo "::notice::The watchdog queued the next session (previous run #${run_number}, '${conclusion}')."
+          {
+            echo "## 🛡️ Watchdog queued a session"
+            echo
+            echo "Previous run #${run_number} ended with \`${conclusion}\` after ${duration_min} min and no successor was running."
+          } >> "${GITHUB_STEP_SUMMARY}"

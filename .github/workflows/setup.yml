@@ -1,0 +1,987 @@
+name: "🪟 Windows 2025 Server TEMP RDP"
+
+on:
+  workflow_dispatch:
+    inputs:
+      session_minutes:
+        description: "Session duration in minutes (maximum 355)"
+        required: false
+        default: "355"
+        type: string
+
+permissions:
+  contents: read
+
+# NEW: only one session may exist at a time. A second run WAITS (it is never started in
+# parallel), so two sets of bots can never share the same Telegram sessions or snowcell.zip.
+concurrency:
+  group: snowcell-rdp
+  cancel-in-progress: false
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 359 # was 360; the bot runner is told the same number (SNOWCELL_JOB_TIMEOUT_MINUTES)
+
+    outputs:
+      # Read by the "restart" job below. The recovery step (when it had to act) has the final say.
+      restart_ok: ${{ steps.recover.outputs.restart_ok || steps.setup.outputs.restart_ok }}
+
+    env:
+      RDP_USERNAME: ATOMA
+      RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+      TAILSCALE_AUTHKEY: ${{ secrets.TAILSCALE_AUTHKEY }}
+      SESSION_MINUTES: ${{ inputs.session_minutes }}
+
+    steps:
+      # ==========================================================
+      # 0. NEW: remember when the job started (job-time budget)
+      # ==========================================================
+      - name: "⏱️ Record job start time"
+        shell: pwsh
+        run: |
+          $epoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+          Add-Content -Path $env:GITHUB_ENV -Value "SNOWCELL_JOB_START_EPOCH=$epoch"
+          Write-Output "Job clock started at $epoch (unix seconds)."
+
+      # ==========================================================
+      # 1. Validate secrets
+      # ==========================================================
+      - name: "🔐 Validate required secrets"
+        shell: pwsh
+        run: |
+          Write-Output "::group::Secret validation"
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+              throw "Missing secret: RDP_PASSWORD"
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTHKEY)) {
+              throw "Missing secret: TAILSCALE_AUTHKEY"
+          }
+
+          Write-Output "::notice::All required secrets are configured."
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 1b. NEW: fetch the bot runner scripts, set up Python, check the R2 configuration
+      #     (fails fast - before any long install - when an R2 secret/variable is missing)
+      # ==========================================================
+      - name: "📥 Check out the bot runner scripts"
+        uses: actions/checkout@v7
+        with:
+          sparse-checkout: |
+            scripts
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: "🐍 Set up Python 3.12"
+        id: py
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: "🧪 Check Snow Cell configuration (offline)"
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_OBJECT_KEY: ${{ vars.R2_OBJECT_KEY }}
+          # R2_TOKEN_VALUE is intentionally NOT passed: the S3 API signs requests with the
+          # access key pair, so the API token value is not needed by any step.
+          SNOWCELL_JOB_TIMEOUT_MINUTES: "359" # must equal timeout-minutes above
+          SNOWCELL_DEADLINE_MODE: ${{ vars.SNOWCELL_DEADLINE_MODE }}
+          SNOWCELL_SHUTDOWN_GRACE_SECONDS: ${{ vars.SNOWCELL_SHUTDOWN_GRACE_SECONDS }}
+          SNOWCELL_FAILURE_POLICY: ${{ vars.SNOWCELL_FAILURE_POLICY }}
+          SNOWCELL_REPLACE_POLICY: ${{ vars.SNOWCELL_REPLACE_POLICY }}
+          SNOWCELL_BOT_ROOT: ${{ vars.SNOWCELL_BOT_ROOT }}
+          SNOWCELL_RESCUE_SECONDS: ${{ vars.SNOWCELL_RESCUE_SECONDS }}
+          SNOWCELL_HEARTBEAT_SECONDS: ${{ vars.SNOWCELL_HEARTBEAT_SECONDS }}
+          SNOWCELL_CRASH_TAIL_LINES: ${{ vars.SNOWCELL_CRASH_TAIL_LINES }}
+        run: |
+          python scripts/setup.py --check-config
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ==========================================================
+      # 2. Configure secure RDP
+      # ==========================================================
+      - name: "🖥️ Enable secure Remote Desktop"
+        shell: pwsh
+        run: |
+          Write-Output "::group::RDP configuration"
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' `
+            -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' `
+            -Value 2
+
+          Get-NetFirewallRule `
+            -DisplayGroup "Remote Desktop" `
+            -ErrorAction SilentlyContinue |
+            Disable-NetFirewallRule
+
+          Get-NetFirewallRule `
+            -Name "RDP-Tailscale-Only" `
+            -ErrorAction SilentlyContinue |
+            Remove-NetFirewallRule
+
+          New-NetFirewallRule `
+            -Name "RDP-Tailscale-Only" `
+            -DisplayName "RDP - Tailscale network only" `
+            -Direction Inbound `
+            -Action Allow `
+            -Protocol TCP `
+            -LocalPort 3389 `
+            -RemoteAddress "100.64.0.0/10" `
+            -Profile Any
+
+          Set-Service -Name TermService -StartupType Automatic
+          Restart-Service -Name TermService -Force
+
+          Write-Output "::notice::RDP enabled with NLA, TLS and a Tailscale-only firewall rule."
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 3. Create the ATOMA administrator account
+      # ==========================================================
+      - name: "👤 Create or update ATOMA"
+        shell: pwsh
+        run: |
+          Write-Output "::group::ATOMA account setup"
+          $ErrorActionPreference = "Stop"
+
+          $securePass = ConvertTo-SecureString `
+            $env:RDP_PASSWORD -AsPlainText -Force
+
+          $user = Get-LocalUser `
+            -Name $env:RDP_USERNAME `
+            -ErrorAction SilentlyContinue
+
+          if ($null -eq $user) {
+              New-LocalUser `
+                -Name $env:RDP_USERNAME `
+                -Password $securePass `
+                -Description "Temporary RDP administrator" `
+                -AccountNeverExpires `
+                -PasswordNeverExpires
+          } else {
+              Set-LocalUser `
+                -Name $env:RDP_USERNAME `
+                -Password $securePass `
+                -PasswordNeverExpires $true
+          }
+
+          foreach ($group in @("Administrators", "Remote Desktop Users")) {
+              $members = Get-LocalGroupMember `
+                -Group $group `
+                -ErrorAction Stop
+
+              $alreadyMember = $members | Where-Object {
+                  $_.Name -eq "$env:COMPUTERNAME\$env:RDP_USERNAME"
+              }
+
+              if (-not $alreadyMember) {
+                  Add-LocalGroupMember `
+                    -Group $group `
+                    -Member $env:RDP_USERNAME
+              }
+          }
+
+          Write-Output "::notice::User ATOMA is configured with administrator and RDP access."
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 4. Install Tailscale machine-wide using WinGet
+      # ==========================================================
+      - name: "🌐 Install Tailscale with WinGet"
+        shell: pwsh
+        run: |
+          Write-Output "::group::Tailscale installation"
+          $ErrorActionPreference = "Stop"
+
+          winget install `
+            --id Tailscale.Tailscale `
+            --exact `
+            --source winget `
+            --scope machine `
+            --silent `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --disable-interactivity
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale installation failed: $LASTEXITCODE"
+          }
+
+          $tailscaleExe = Join-Path `
+            $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscaleExe)) {
+              throw "Tailscale executable not found."
+          }
+
+          & $tailscaleExe version
+          Write-Output "::notice::Tailscale installed machine-wide."
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 5. Connect Tailscale (verbose logs suppressed)
+      # ==========================================================
+      - name: "🔗 Connect to Tailscale"
+        shell: pwsh
+        run: |
+          Write-Output "::group::Tailscale connection"
+          $ErrorActionPreference = "Stop"
+
+          $tailscaleExe = Join-Path `
+            $env:ProgramFiles "Tailscale\tailscale.exe"
+
+          $service = Get-Service -Name Tailscale -ErrorAction Stop
+
+          if ($service.Status -ne "Running") {
+              Start-Service -Name Tailscale
+              $service.WaitForStatus(
+                "Running",
+                [TimeSpan]::FromSeconds(30)
+              )
+          }
+
+          & $tailscaleExe up `
+            "--authkey=$($env:TAILSCALE_AUTHKEY)" `
+            "--hostname=gh-runner-$($env:GITHUB_RUN_ID)" `
+            --unattended
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Tailscale authentication or connection failed."
+          }
+
+          $tsIP = $null
+
+          for ($i = 0; $i -lt 30; $i++) {
+              $candidate = & $tailscaleExe ip -4 2>$null |
+                Select-Object -First 1
+
+              if ($candidate -match '^\d{1,3}(\.\d{1,3}){3}$') {
+                  $tsIP = $candidate.Trim()
+                  break
+              }
+
+              Start-Sleep -Seconds 2
+          }
+
+          if (-not $tsIP) {
+              throw "Could not obtain the Tailscale IPv4 address."
+          }
+
+          Add-Content -Path $env:GITHUB_ENV `
+            -Value "TAILSCALE_IP=$tsIP"
+
+          Write-Output "::notice::Tailscale IPv4 address: $tsIP"
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 6. Verify RDP
+      # ==========================================================
+      - name: "🔍 Verify RDP connectivity"
+        shell: pwsh
+        run: |
+          Write-Output "::group::RDP connectivity check"
+          $ErrorActionPreference = "Stop"
+
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (-not $result.TcpTestSucceeded) {
+              throw "RDP is not reachable through Tailscale."
+          }
+
+          Write-Output "::notice::RDP is reachable over the Tailscale network."
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 7. Install Cloudflare WARP machine-wide
+      # ==========================================================
+      - name: "☁️ Install Cloudflare WARP with WinGet"
+        shell: pwsh
+        run: |
+          Write-Output "::group::Cloudflare WARP installation"
+          $ErrorActionPreference = "Stop"
+
+          winget install `
+            --id Cloudflare.Warp `
+            --exact `
+            --source winget `
+            --scope machine `
+            --silent `
+            --accept-source-agreements `
+            --accept-package-agreements `
+            --disable-interactivity
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Cloudflare WARP installation failed: $LASTEXITCODE"
+          }
+
+          $warpDir = Join-Path `
+            $env:ProgramFiles "Cloudflare\Cloudflare WARP"
+
+          $warpCli = Join-Path $warpDir "warp-cli.exe"
+
+          if (-not (Test-Path $warpCli)) {
+              throw "WARP CLI was not found after installation."
+          }
+
+          Write-Output "::notice::Cloudflare WARP installed machine-wide."
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 8. Connect WARP and preserve RDP connectivity
+      # ==========================================================
+      - name: "🔒 Connect Cloudflare WARP"
+        shell: pwsh
+        run: |
+          Write-Output "::group::Cloudflare WARP connection"
+          $ErrorActionPreference = "Stop"
+
+          $warpCli = Join-Path `
+            $env:ProgramFiles "Cloudflare\Cloudflare WARP\warp-cli.exe"
+
+          $warpConnected = $false
+
+          try {
+              & $warpCli registration new
+              & $warpCli connect
+
+              if ($LASTEXITCODE -ne 0) {
+                  throw "WARP connection command failed."
+              }
+
+              for ($i = 0; $i -lt 12; $i++) {
+                  Start-Sleep -Seconds 5
+
+                  $trace = & curl.exe `
+                    --silent `
+                    --max-time 10 `
+                    "https://www.cloudflare.com/cdn-cgi/trace" `
+                    2>$null
+
+                  if ($trace -match '(?m)^warp=on$') {
+                      $warpConnected = $true
+                      break
+                  }
+              }
+
+              if (-not $warpConnected) {
+                  throw "Could not verify an active WARP tunnel."
+              }
+          } catch {
+              Write-Output "::warning::Automatic WARP activation failed: $($_.Exception.Message)"
+
+              Add-Content -Path $env:GITHUB_ENV `
+                -Value "WARP_STATE=MANUAL_SETUP_REQUIRED"
+          }
+
+          if ($warpConnected) {
+              Add-Content -Path $env:GITHUB_ENV `
+                -Value "WARP_STATE=CONNECTED"
+
+              Start-Sleep -Seconds 5
+
+              $rdp = Test-NetConnection `
+                -ComputerName $env:TAILSCALE_IP `
+                -Port 3389 `
+                -WarningAction SilentlyContinue
+
+              if (-not $rdp.TcpTestSucceeded) {
+                  Write-Output "::warning::WARP affected RDP connectivity; disconnecting WARP."
+
+                  & $warpCli disconnect
+
+                  if ($LASTEXITCODE -ne 0) {
+                      throw "Could not disconnect WARP to preserve RDP connectivity."
+                  }
+
+                  Add-Content -Path $env:GITHUB_ENV `
+                    -Value "WARP_STATE=DISCONNECTED_TO_PRESERVE_RDP"
+
+                  Start-Sleep -Seconds 10
+
+                  $rdp = Test-NetConnection `
+                    -ComputerName $env:TAILSCALE_IP `
+                    -Port 3389 `
+                    -WarningAction SilentlyContinue
+
+                  if (-not $rdp.TcpTestSucceeded) {
+                      throw "RDP connectivity did not recover after disconnecting WARP."
+                  }
+              }
+          }
+
+          Write-Output "::notice::WARP state: $env:WARP_STATE"
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 8b. NEW: create the ATOMA profile and its Downloads folder without any RDP login
+      # ==========================================================
+      - name: "📁 Prepare ATOMA Downloads folder (no login needed)"
+        shell: pwsh
+        run: |
+          Write-Output "::group::ATOMA profile and Downloads folder"
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:ProgramData "ATOMA-AppSetup"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+          $account = "$($env:COMPUTERNAME)\$($env:RDP_USERNAME)"
+          $taskName = "ATOMA-CreateProfile"
+          $helperPath = Join-Path $root "Create-Profile.ps1"
+          $resultPath = Join-Path $root "profile.txt"
+          Remove-Item -Path $resultPath -Force -ErrorAction SilentlyContinue
+
+          # The helper runs inside a real (non-interactive) ATOMA logon. Windows creates the
+          # profile folder C:\Users\ATOMA at that moment, exactly as the first RDP login would,
+          # so the later RDP session finds the same Downloads folder.
+          $helperLines = @(
+            '$root = Join-Path $env:ProgramData "ATOMA-AppSetup"',
+            '$downloads = Join-Path $env:USERPROFILE "Downloads"',
+            'New-Item -ItemType Directory -Path $downloads -Force | Out-Null',
+            'Set-Content -Path (Join-Path $root "profile.txt") -Value $downloads -Encoding ASCII'
+          )
+          Set-Content -Path $helperPath -Value ($helperLines -join "`r`n") -Encoding UTF8
+
+          $downloads = $null
+          try {
+              $action = New-ScheduledTaskAction `
+                -Execute "powershell.exe" `
+                -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$helperPath`""
+
+              $settings = New-ScheduledTaskSettingsSet `
+                -MultipleInstances IgnoreNew `
+                -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+
+              # -User/-Password makes Windows perform a real logon for ATOMA (no -Principal here:
+              # it is a different parameter set).
+              Register-ScheduledTask `
+                -TaskName $taskName `
+                -Action $action `
+                -Settings $settings `
+                -User $account `
+                -Password $env:RDP_PASSWORD `
+                -RunLevel Highest `
+                -Force | Out-Null
+
+              Start-ScheduledTask -TaskName $taskName
+
+              for ($i = 0; $i -lt 60; $i++) {
+                  Start-Sleep -Seconds 2
+
+                  if (Test-Path $resultPath) {
+                      $value = Get-Content -Path $resultPath -Raw -ErrorAction SilentlyContinue
+
+                      if ($value -and $value.Trim()) {
+                          $downloads = $value.Trim()
+                          break
+                      }
+                  }
+              }
+
+              if (-not $downloads) {
+                  throw "The ATOMA profile was not created within 2 minutes."
+              }
+
+              if ($downloads -notlike "*\Users\$($env:RDP_USERNAME)*") {
+                  throw "Unexpected profile location: $downloads"
+              }
+          } catch {
+              Write-Output "::warning::Could not create the ATOMA profile through a background logon: $($_.Exception.Message)"
+              $downloads = $null
+          } finally {
+              Unregister-ScheduledTask `
+                -TaskName $taskName `
+                -Confirm:$false `
+                -ErrorAction SilentlyContinue
+          }
+
+          if (-not $downloads) {
+              $downloads = "C:\Users\$($env:RDP_USERNAME)\Downloads"
+              New-Item -ItemType Directory -Path $downloads -Force | Out-Null
+              Write-Output "::warning::Using $downloads without a registered profile; Windows may create a separate profile folder at the first RDP login."
+          }
+
+          Add-Content -Path $env:GITHUB_ENV `
+            -Value "SNOWCELL_DOWNLOADS_DIR=$downloads"
+
+          Write-Output "::notice::ATOMA Downloads folder: $downloads"
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 9. Display RDP details + rich step summary
+      # ==========================================================
+      - name: "📋 Display RDP connection details"
+        shell: pwsh
+        run: |
+          Write-Output "::group::RDP connection details"
+          $ErrorActionPreference = "Stop"
+
+          [int]$minutes = 355
+
+          if (-not [int]::TryParse($env:SESSION_MINUTES, [ref]$minutes)) {
+              $minutes = 355
+          }
+
+          $minutes = [math]::Max(1, [math]::Min(355, $minutes))
+
+          Write-Output ""
+          Write-Output "========================================"
+          Write-Output "  TEMPORARY RDP SESSION READY"
+          Write-Output "========================================"
+          Write-Output "  Username       : $env:RDP_USERNAME"
+          Write-Output "  Tailscale IPv4 : $env:TAILSCALE_IP"
+          Write-Output "  Password       : Hidden (GitHub Secrets)"
+          Write-Output "  Duration       : $minutes minutes"
+          Write-Output "  WARP status    : $env:WARP_STATE"
+          Write-Output "========================================"
+          Write-Output "  Telegram / WhatsApp install in the background - no RDP login needed."
+          Write-Output "  Apps log: C:\ProgramData\ATOMA-AppSetup\install.log"
+          Write-Output "  Bots folder    : $env:SNOWCELL_DOWNLOADS_DIR\snowcell"
+          Write-Output "========================================"
+          Write-Output ""
+
+          $summary = "## 🪟 Temporary RDP Session Ready`n`n" +
+            "| Item | Value |`n" +
+            "|------|-------|`n" +
+            "| 👤 Username | ``$($env:RDP_USERNAME)`` |`n" +
+            "| 🌐 Tailscale IPv4 | ``$($env:TAILSCALE_IP)`` |`n" +
+            "| 🔑 Password | Hidden (GitHub Secrets) |`n" +
+            "| ⏱️ Duration | **$minutes minutes** |`n" +
+            "| ☁️ WARP Status | ``$($env:WARP_STATE)`` |`n" +
+            "| 🤖 Bots folder | ``$($env:SNOWCELL_DOWNLOADS_DIR)\snowcell`` |`n`n" +
+            "> **Telegram and WhatsApp install in the background - no RDP login needed.**`n" +
+            "> App install log: ``C:\ProgramData\ATOMA-AppSetup\install.log``"
+
+          Add-Content -Path $env:GITHUB_STEP_SUMMARY -Value $summary
+
+          Write-Output "::notice::RDP session ready - user: $env:RDP_USERNAME - IP: $env:TAILSCALE_IP - duration: $minutes minutes"
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 10. Configure app installation for ATOMA
+      #     CHANGED: the installation now starts in the BACKGROUND right away, so nobody has
+      #     to log in over RDP. The original "run at ATOMA's first logon" task is still
+      #     registered as a fallback (it exits at once when everything is already installed).
+      # ==========================================================
+      - name: "👤 Configure app installation for ATOMA"
+        shell: pwsh
+        run: |
+          Write-Output "::group::ATOMA app installation setup"
+          $ErrorActionPreference = "Stop"
+
+          $root = Join-Path $env:ProgramData "ATOMA-AppSetup"
+          New-Item -ItemType Directory -Path $root -Force | Out-Null
+
+          $scriptPath = Join-Path $root "Install-Apps-As-ATOMA.ps1"
+          $taskName = "ATOMA-FirstLogon-AppSetup"
+          $account = "$($env:COMPUTERNAME)\$($env:RDP_USERNAME)"
+
+          # Build the inner script as an array of lines.
+          # This avoids YAML block-scalar / here-string indentation conflicts.
+          $scriptLines = @(
+            '$ErrorActionPreference = "Stop"',
+            '$ProgressPreference = "SilentlyContinue"',
+            '',
+            '$root = Join-Path $env:ProgramData "ATOMA-AppSetup"',
+            '$logPath = Join-Path $root "install.log"',
+            '$statusPath = Join-Path $root "status.txt"',
+            '$successPath = Join-Path $root "success.flag"',
+            '$lockPath = Join-Path $root "run.lock"',
+            '',
+            'New-Item -ItemType Directory -Path $root -Force | Out-Null',
+            '',
+            '# Only one copy may run at a time: the background run and the first-logon run share this script.',
+            '$lock = $null',
+            'try {',
+            '    $lock = [System.IO.File]::Open($lockPath, [System.IO.FileMode]::OpenOrCreate, [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::None)',
+            '} catch {',
+            '    Write-Host "Another ATOMA app setup run is already active; this run exits."',
+            '    return',
+            '}',
+            '',
+            'try { Start-Transcript -Path $logPath -Append | Out-Null } catch {}',
+            '',
+            'try {',
+            '    if (Test-Path $successPath) {',
+            '        Write-Host "ATOMA app setup already completed."',
+            '        return',
+            '    }',
+            '',
+            '    Set-Content -Path $statusPath -Value "RUNNING: Preparing ATOMA apps"',
+            '    Write-Host "Installing applications in the ATOMA user session (no RDP login needed)..."',
+            '',
+            '    $script:wingetPath = $null',
+            '    for ($attempt = 0; $attempt -lt 6; $attempt++) {',
+            '        try {',
+            '            Add-AppxPackage -RegisterByFamilyName -MainPackage "Microsoft.DesktopAppInstaller_8wekyb3d8bbwe" -ErrorAction Stop',
+            '        } catch {}',
+            '        $candidate = Join-Path $env:LOCALAPPDATA "Microsoft\WindowsApps\winget.exe"',
+            '        if (Test-Path $candidate) {',
+            '            $null = & $candidate --version 2>&1',
+            '            if ($LASTEXITCODE -eq 0) { $script:wingetPath = $candidate; break }',
+            '        }',
+            '        $cmd = Get-Command winget.exe -ErrorAction SilentlyContinue',
+            '        if ($cmd) { $script:wingetPath = $cmd.Source; break }',
+            '        Start-Sleep -Seconds 5',
+            '    }',
+            '',
+            '    if ($script:wingetPath) {',
+            '        Write-Host "WinGet path: $script:wingetPath"',
+            '    } else {',
+            '        Write-Warning "WinGet is unavailable in the ATOMA session; direct downloads are used where possible."',
+            '    }',
+            '',
+            '    $script:failedPackages = @()',
+            '    $script:notes = @()',
+            '    function Invoke-WingetChecked {',
+            '        param([string]$Label, [string[]]$Arguments, [string]$ExpectedNoChangeRegex = "")',
+            '        $ErrorActionPreference = "Continue"',
+            '        if (-not $script:wingetPath) { Write-Host "$Label skipped: WinGet is unavailable."; return $false }',
+            '        Write-Host "Installing: $Label"',
+            '        $output = & $script:wingetPath @Arguments 2>&1',
+            '        $exitCode = $LASTEXITCODE',
+            '        $text = ($output | Out-String)',
+            '        Write-Host $text',
+            '        if ($exitCode -eq 0) { Write-Host "$Label completed."; return $true }',
+            '        if ($ExpectedNoChangeRegex -and $text -match $ExpectedNoChangeRegex) { Write-Host "$Label already up to date."; return $true }',
+            '        Write-Warning "$Label failed with code $exitCode."',
+            '        return $false',
+            '    }',
+            '',
+            '    function Find-TelegramExe {',
+            '        $candidates = @((Join-Path $env:APPDATA "Telegram Desktop\Telegram.exe"), (Join-Path $env:LOCALAPPDATA "Programs\Telegram Desktop\Telegram.exe"), (Join-Path $env:LOCALAPPDATA "Telegram Desktop\Telegram.exe"))',
+            '        return ($candidates | Where-Object { Test-Path $_ } | Select-Object -First 1)',
+            '    }',
+            '',
+            '    # Telegram: WinGet first, then the official installer download',
+            '    $telegramOk = [bool](Find-TelegramExe)',
+            '    if ($telegramOk) { Write-Host "Telegram Desktop is already installed." }',
+            '    if (-not $telegramOk) {',
+            '        $null = Invoke-WingetChecked -Label "Telegram" -Arguments @("install", "--id", "Telegram.TelegramDesktop", "--exact", "--source", "winget", "--scope", "user", "--silent", "--accept-source-agreements", "--accept-package-agreements", "--disable-interactivity")',
+            '        $telegramOk = [bool](Find-TelegramExe)',
+            '    }',
+            '    if (-not $telegramOk) {',
+            '        Write-Host "Telegram: falling back to the official installer download."',
+            '        try {',
+            '            $telegramSetup = Join-Path $env:TEMP "tsetup-x64.exe"',
+            '            Invoke-WebRequest -Uri "https://telegram.org/dl/desktop/win64" -OutFile $telegramSetup -UseBasicParsing',
+            '            $setupProcess = Start-Process -FilePath $telegramSetup -ArgumentList "/VERYSILENT", "/NORESTART" -PassThru',
+            '            if ($setupProcess.WaitForExit(600000)) {',
+            '                Write-Host "Telegram installer exit code: $($setupProcess.ExitCode)"',
+            '            } else {',
+            '                Write-Warning "The Telegram installer did not finish within 10 minutes."',
+            '            }',
+            '        } catch {',
+            '            Write-Warning "Direct Telegram install failed: $($_.Exception.Message)"',
+            '        }',
+            '        $telegramOk = [bool](Find-TelegramExe)',
+            '    }',
+            '    if (-not $telegramOk) { $script:failedPackages += "Telegram" }',
+            '',
+            '    # WhatsApp: the native app is published through the Microsoft Store only (Windows Server has no Store)',
+            '    $whatsappNative = Invoke-WingetChecked -Label "WhatsApp" -Arguments @("install", "--id", "9NKSQGP7F2NH", "--source", "msstore", "--silent", "--accept-source-agreements", "--accept-package-agreements", "--disable-interactivity")',
+            '',
+            '    # Chrome (machine-wide; already present on the GitHub runner image)',
+            '    $chromePaths = @((Join-Path $env:ProgramFiles "Google\Chrome\Application\chrome.exe"), (Join-Path ${env:ProgramFiles(x86)} "Google\Chrome\Application\chrome.exe"))',
+            '    $chromeExe = $chromePaths | Where-Object { Test-Path $_ } | Select-Object -First 1',
+            '    if ($chromeExe) {',
+            '        $chromeUpdated = Invoke-WingetChecked -Label "Chrome Update" -Arguments @("upgrade", "--id", "Google.Chrome", "--exact", "--source", "winget", "--scope", "machine", "--silent", "--accept-source-agreements", "--accept-package-agreements", "--disable-interactivity") -ExpectedNoChangeRegex "(?i)No applicable upgrade found|No available upgrade found"',
+            '        if (-not $chromeUpdated) { $script:notes += "Chrome was already installed; the update step did not complete" }',
+            '    } else {',
+            '        $null = Invoke-WingetChecked -Label "Chrome Install" -Arguments @("install", "--id", "Google.Chrome", "--exact", "--source", "winget", "--scope", "machine", "--silent", "--accept-source-agreements", "--accept-package-agreements", "--disable-interactivity")',
+            '        $chromeExe = $chromePaths | Where-Object { Test-Path $_ } | Select-Object -First 1',
+            '        if (-not $chromeExe) { $script:failedPackages += "Chrome" }',
+            '    }',
+            '',
+            '    # Shortcuts',
+            '    $desktop = Join-Path $env:USERPROFILE "Desktop"',
+            '    New-Item -ItemType Directory -Path $desktop -Force | Out-Null',
+            '    $shell = New-Object -ComObject WScript.Shell',
+            '    function New-DesktopShortcut {',
+            '        param([string]$Name, [string]$Target, [string]$Arguments = "")',
+            '        if (-not (Test-Path $Target)) { Write-Host "Target not found: $Target"; return }',
+            '        $path = Join-Path $desktop "$Name.lnk"',
+            '        $shortcut = $shell.CreateShortcut($path)',
+            '        $shortcut.TargetPath = $Target',
+            '        if ($Arguments) { $shortcut.Arguments = $Arguments }',
+            '        $shortcut.WorkingDirectory = Split-Path $Target -Parent',
+            '        $shortcut.Save()',
+            '        Write-Host "Shortcut created: $Name"',
+            '    }',
+            '',
+            '    $telegramExe = Find-TelegramExe',
+            '    if ($telegramExe) { New-DesktopShortcut -Name "Telegram Desktop" -Target $telegramExe }',
+            '',
+            '    Start-Sleep -Seconds 3',
+            '    $whatsappApp = $null',
+            '    try { $whatsappApp = Get-StartApps | Where-Object { $_.Name -match "WhatsApp" } | Select-Object -First 1 } catch {}',
+            '    $whatsappShortcut = "none"',
+            '    if ($whatsappApp) {',
+            '        $explorer = Join-Path $env:WINDIR "explorer.exe"',
+            '        $shortcutPath = Join-Path $desktop "WhatsApp.lnk"',
+            '        $shortcut = $shell.CreateShortcut($shortcutPath)',
+            '        $shortcut.TargetPath = $explorer',
+            '        $shortcut.Arguments = "shell:AppsFolder\$($whatsappApp.AppID)"',
+            '        $shortcut.Save()',
+            '        Write-Host "WhatsApp shortcut created."',
+            '        $whatsappShortcut = "app"',
+            '    }',
+            '',
+            '    $chromeExe = $chromePaths | Where-Object { Test-Path $_ } | Select-Object -First 1',
+            '    if ($chromeExe) { New-DesktopShortcut -Name "Google Chrome" -Target $chromeExe }',
+            '    if (($whatsappShortcut -eq "none") -and $chromeExe) {',
+            '        New-DesktopShortcut -Name "WhatsApp Web" -Target $chromeExe -Arguments "--app=https://web.whatsapp.com/"',
+            '        $whatsappShortcut = "web"',
+            '        if (-not $whatsappNative) { $script:notes += "WhatsApp: the native app needs the Microsoft Store, which Windows Server does not have; a WhatsApp Web app shortcut was created instead" }',
+            '    }',
+            '    if (($whatsappShortcut -eq "none") -and (-not $whatsappNative)) { $script:failedPackages += "WhatsApp" }',
+            '',
+            '    $tailscaleGui = Join-Path $env:ProgramFiles "Tailscale\ipn.exe"',
+            '    if (Test-Path $tailscaleGui) { New-DesktopShortcut -Name "Tailscale" -Target $tailscaleGui }',
+            '',
+            '    $warpGui = Join-Path $env:ProgramFiles "Cloudflare\Cloudflare WARP\Cloudflare WARP.exe"',
+            '    if (Test-Path $warpGui) { New-DesktopShortcut -Name "Cloudflare WARP" -Target $warpGui }',
+            '',
+            '    if ($script:failedPackages.Count -gt 0) {',
+            '        $failureText = $script:failedPackages -join "; "',
+            '        Set-Content -Path $statusPath -Value "FAILED: $failureText"',
+            '        throw "One or more packages failed: $failureText"',
+            '    }',
+            '',
+            '    Set-Content -Path $successPath -Value "Completed at $(Get-Date -Format o)"',
+            '    if ($script:notes.Count -gt 0) {',
+            '        Set-Content -Path $statusPath -Value ("SUCCESS (with notes): " + ($script:notes -join "; "))',
+            '    } else {',
+            '        Set-Content -Path $statusPath -Value "SUCCESS: ATOMA apps installed and shortcuts created"',
+            '    }',
+            '    Write-Host "ATOMA app setup completed successfully."',
+            '} catch {',
+            '    $message = "FAILED: $($_.Exception.Message)"',
+            '    Set-Content -Path $statusPath -Value $message',
+            '    Write-Error $message',
+            '    throw',
+            '} finally {',
+            '    try { Stop-Transcript | Out-Null } catch {}',
+            '    if ($lock) { $lock.Dispose() }',
+            '}'
+          )
+
+          $scriptContent = $scriptLines -join "`r`n"
+          Set-Content -Path $scriptPath -Value $scriptContent -Encoding UTF8
+
+          # --- Original (unchanged): first-logon task, kept as a fallback ---
+          # --- Register task for Interactive Logon (No Password) ---
+          # This avoids the parameter-set conflict between -Principal, -User, and -Password.
+          $action = New-ScheduledTaskAction `
+            -Execute "powershell.exe" `
+            -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+
+          # Trigger: At log on of the specific ATOMA user
+          $trigger = New-ScheduledTaskTrigger -AtLogOn -User $account
+
+          # Principal: Run interactively as ATOMA with highest privileges
+          $principal = New-ScheduledTaskPrincipal `
+            -UserId $account `
+            -LogonType Interactive `
+            -RunLevel Highest
+
+          $settings = New-ScheduledTaskSettingsSet `
+            -StartWhenAvailable `
+            -MultipleInstances IgnoreNew `
+            -ExecutionTimeLimit (New-TimeSpan -Minutes 45)
+
+          # Register WITHOUT -User and WITHOUT -Password
+          Register-ScheduledTask `
+            -TaskName $taskName `
+            -Action $action `
+            -Trigger $trigger `
+            -Principal $principal `
+            -Settings $settings `
+            -Force | Out-Null
+
+          # No Start-ScheduledTask here. It will run automatically on login.
+
+          $statusPath = Join-Path $root "status.txt"
+          Set-Content -Path $statusPath -Value "PENDING: Waiting for the background installation to start."
+
+          # --- NEW: start the same installation right now, in the background, without a login ---
+          # -User/-Password makes Windows perform a real (non-interactive) logon for ATOMA, so the
+          # per-user installs run now. Telegram and WhatsApp therefore no longer depend on an RDP login.
+          $backgroundTask = "ATOMA-AppSetup-Now"
+
+          try {
+              $nowSettings = New-ScheduledTaskSettingsSet `
+                -MultipleInstances IgnoreNew `
+                -ExecutionTimeLimit (New-TimeSpan -Minutes 45)
+
+              Set-Content -Path $statusPath -Value "RUNNING: Background installation is starting (no login needed)."
+
+              Register-ScheduledTask `
+                -TaskName $backgroundTask `
+                -Action $action `
+                -Settings $nowSettings `
+                -User $account `
+                -Password $env:RDP_PASSWORD `
+                -RunLevel Highest `
+                -Force | Out-Null
+
+              Start-ScheduledTask -TaskName $backgroundTask
+
+              Write-Output "::notice::App installation started in the background; no RDP login is needed."
+          } catch {
+              Write-Output "::warning::Could not start the background installation: $($_.Exception.Message)"
+              Write-Output "::warning::The installation will start when ATOMA signs in (first-logon task)."
+              Set-Content -Path $statusPath -Value "PENDING: Sign in as ATOMA to start installation."
+          }
+
+          Write-Output "::notice::Install log: $root\install.log"
+          Write-Output "::endgroup::"
+
+      # ==========================================================
+      # 11. CHANGED: run the Snow Cell bots for the session, then save snowcell.zip to R2
+      #     (replaces the keep-alive loop; the bots keep the session alive and the step
+      #      logs the session heartbeat and the ATOMA app status exactly like the loop did)
+      # ==========================================================
+      - name: "🤖 Run Snow Cell bots and sync snowcell.zip with R2"
+        id: setup
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_OBJECT_KEY: ${{ vars.R2_OBJECT_KEY }}
+          # R2_TOKEN_VALUE is intentionally NOT passed: the S3 API signs requests with the
+          # access key pair, so the API token value is not needed by any step.
+          SNOWCELL_JOB_TIMEOUT_MINUTES: "359" # must equal timeout-minutes above
+          SNOWCELL_DEADLINE_MODE: ${{ vars.SNOWCELL_DEADLINE_MODE }}
+          SNOWCELL_SHUTDOWN_GRACE_SECONDS: ${{ vars.SNOWCELL_SHUTDOWN_GRACE_SECONDS }}
+          SNOWCELL_FAILURE_POLICY: ${{ vars.SNOWCELL_FAILURE_POLICY }}
+          SNOWCELL_REPLACE_POLICY: ${{ vars.SNOWCELL_REPLACE_POLICY }}
+          SNOWCELL_BOT_ROOT: ${{ vars.SNOWCELL_BOT_ROOT }}
+          SNOWCELL_RESCUE_SECONDS: ${{ vars.SNOWCELL_RESCUE_SECONDS }}
+          SNOWCELL_HEARTBEAT_SECONDS: ${{ vars.SNOWCELL_HEARTBEAT_SECONDS }}
+          SNOWCELL_CRASH_TAIL_LINES: ${{ vars.SNOWCELL_CRASH_TAIL_LINES }}
+        run: |
+          python scripts/setup.py
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      # ==========================================================
+      # 12. NEW: safety net. Runs even when step 11 was cancelled, timed out or died: stops any
+      #     bot that is still running and finishes the zip/compare/delete/upload/verify cycle.
+      #     It does nothing when step 11 already finished (idempotent).
+      # ==========================================================
+      - name: "🛟 Recover and publish snowcell.zip if the bot step was interrupted"
+        id: recover
+        if: ${{ always() && steps.py.conclusion == 'success' && steps.setup.conclusion != 'skipped' }}
+        shell: pwsh
+        working-directory: ${{ github.workspace }}
+        env:
+          R2_ACCOUNT_ID: ${{ secrets.R2_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET_NAME: ${{ vars.R2_BUCKET_NAME }}
+          R2_OBJECT_KEY: ${{ vars.R2_OBJECT_KEY }}
+          # R2_TOKEN_VALUE is intentionally NOT passed: the S3 API signs requests with the
+          # access key pair, so the API token value is not needed by any step.
+          SNOWCELL_JOB_TIMEOUT_MINUTES: "359" # must equal timeout-minutes above
+          SNOWCELL_DEADLINE_MODE: ${{ vars.SNOWCELL_DEADLINE_MODE }}
+          SNOWCELL_SHUTDOWN_GRACE_SECONDS: ${{ vars.SNOWCELL_SHUTDOWN_GRACE_SECONDS }}
+          SNOWCELL_FAILURE_POLICY: ${{ vars.SNOWCELL_FAILURE_POLICY }}
+          SNOWCELL_REPLACE_POLICY: ${{ vars.SNOWCELL_REPLACE_POLICY }}
+          SNOWCELL_BOT_ROOT: ${{ vars.SNOWCELL_BOT_ROOT }}
+          SNOWCELL_RESCUE_SECONDS: ${{ vars.SNOWCELL_RESCUE_SECONDS }}
+          SNOWCELL_HEARTBEAT_SECONDS: ${{ vars.SNOWCELL_HEARTBEAT_SECONDS }}
+          SNOWCELL_CRASH_TAIL_LINES: ${{ vars.SNOWCELL_CRASH_TAIL_LINES }}
+        run: |
+          python scripts/setup.py --recover
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  # ============================================================
+  # 13. NEW: queue the next session as soon as this one has finished.
+  #     Runs only after a normal end or a job timeout - never after a person pressed Cancel,
+  #     and never when the bot runner said "do not restart" (see docs/RUNBOOK.md).
+  #     The new run waits for this one to finish (concurrency group), so sessions never overlap.
+  # ============================================================
+  restart:
+    name: "♻️ Queue the next session"
+    needs: secure-rdp
+    if: ${{ !cancelled() && vars.SNOWCELL_AUTORESTART != 'false' && needs.secure-rdp.outputs.restart_ok == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      actions: write # lets the built-in token start a workflow_dispatch run (no personal token needed)
+      contents: read
+
+    steps:
+      - name: "♻️ Dispatch the next run"
+        shell: bash
+        env:
+          # The built-in token is enough. Only if your organization forbids "actions: write" for
+          # GITHUB_TOKEN, add a fine-grained token (Actions: read and write) as SNOWCELL_DISPATCH_TOKEN.
+          GH_TOKEN: ${{ secrets.SNOWCELL_DISPATCH_TOKEN || github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REF_NAME: ${{ github.ref_name }}
+          SESSION_MINUTES: ${{ inputs.session_minutes }}
+          MIN_RUN_MINUTES: ${{ vars.SNOWCELL_MIN_RESTART_MINUTES || '30' }}
+        run: |
+          set -euo pipefail
+
+          # owner/repo/.github/workflows/<file>@refs/heads/<branch>  ->  <file>
+          workflow_file="${WORKFLOW_REF#*/.github/workflows/}"
+          workflow_file="${workflow_file%%@*}"
+          echo "Workflow file: ${workflow_file}"
+
+          # Restart-loop guard: a run that ended within minutes never re-queues itself.
+          started_at="$(gh api "repos/${GH_REPO}/actions/runs/${RUN_ID}" --jq '.run_started_at')"
+          elapsed_minutes=$(( ( $(date -u +%s) - $(date -u -d "${started_at}" +%s) ) / 60 ))
+          echo "This run has been active for ${elapsed_minutes} minute(s)."
+          if [ "${elapsed_minutes}" -lt "${MIN_RUN_MINUTES}" ]; then
+            echo "::warning::The run lasted less than ${MIN_RUN_MINUTES} minutes; not restarting automatically (restart-loop guard)."
+            exit 0
+          fi
+
+          # Never queue a second session while another run is queued or running (this run excluded).
+          others="$(gh api "repos/${GH_REPO}/actions/workflows/${workflow_file}/runs?per_page=20" \
+            --jq "[.workflow_runs[] | select(.status != \"completed\" and .id != ${RUN_ID})] | length")"
+          if [ "${others}" -gt 0 ]; then
+            echo "::notice::Another run of this workflow is already queued or running; not starting a second one."
+            exit 0
+          fi
+
+          gh workflow run "${workflow_file}" --ref "${REF_NAME}" -f "session_minutes=${SESSION_MINUTES:-355}"
+          echo "::notice::Next session queued on ${REF_NAME} (it starts when this run has finished)."
+          {
+            echo "## ♻️ Next session queued"
+            echo
+            echo "A new run of \`${workflow_file}\` was dispatched on \`${REF_NAME}\`. It starts as soon as this run has finished."
+          } >> "${GITHUB_STEP_SUMMARY}"
